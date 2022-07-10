@@ -5,6 +5,7 @@ import uuid
 import warnings
 import weakref
 from datetime import datetime
+from datetime import timezone
 from platform import python_implementation
 from threading import Thread
 
@@ -436,7 +437,7 @@ def test_session_expiration(app, client):
     assert "set-cookie" in rv.headers
     match = re.search(r"(?i)\bexpires=([^;]+)", rv.headers["set-cookie"])
     expires = parse_date(match.group())
-    expected = datetime.utcnow() + app.permanent_session_lifetime
+    expected = datetime.now(timezone.utc) + app.permanent_session_lifetime
     assert expires.year == expected.year
     assert expires.month == expected.month
     assert expires.day == expected.day
@@ -466,7 +467,7 @@ def test_session_stored_last(app, client):
 
 
 def test_session_special_types(app, client):
-    now = datetime.utcnow().replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     the_uuid = uuid.uuid4()
 
     @app.route("/")
@@ -927,13 +928,8 @@ def test_baseexception_error_handling(app, client):
     def broken_func():
         raise KeyboardInterrupt()
 
-    with client:
-        with pytest.raises(KeyboardInterrupt):
-            client.get("/")
-
-        ctx = flask._request_ctx_stack.top
-        assert ctx.preserved
-        assert type(ctx._preserved_exc) is KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        client.get("/")
 
 
 def test_before_request_and_routing_errors(app, client):
@@ -1114,14 +1110,10 @@ def test_enctype_debug_helper(app, client):
     def index():
         return flask.request.files["foo"].filename
 
-    # with statement is important because we leave an exception on the
-    # stack otherwise and we want to ensure that this is not the case
-    # to not negatively affect other tests.
-    with client:
-        with pytest.raises(DebugFilesKeyError) as e:
-            client.post("/fail", data={"foo": "index.txt"})
-        assert "no file contents were transmitted" in str(e.value)
-        assert "This was submitted: 'index.txt'" in str(e.value)
+    with pytest.raises(DebugFilesKeyError) as e:
+        client.post("/fail", data={"foo": "index.txt"})
+    assert "no file contents were transmitted" in str(e.value)
+    assert "This was submitted: 'index.txt'" in str(e.value)
 
 
 def test_response_types(app, client):
@@ -1170,6 +1162,10 @@ def test_response_types(app, client):
     def from_dict():
         return {"foo": "bar"}, 201
 
+    @app.route("/list")
+    def from_list():
+        return ["foo", "bar"], 201
+
     assert client.get("/text").data == "Hällo Wörld".encode()
     assert client.get("/bytes").data == "Hällo Wörld".encode()
 
@@ -1207,6 +1203,10 @@ def test_response_types(app, client):
 
     rv = client.get("/dict")
     assert rv.json == {"foo": "bar"}
+    assert rv.status_code == 201
+
+    rv = client.get("/list")
+    assert rv.json == ["foo", "bar"]
     assert rv.status_code == 201
 
 
@@ -1273,6 +1273,11 @@ def test_make_response(app, req_ctx):
     rv = flask.make_response("W00t", 404)
     assert rv.status_code == 404
     assert rv.data == b"W00t"
+    assert rv.mimetype == "text/html"
+
+    rv = flask.make_response(c for c in "Hello")
+    assert rv.status_code == 200
+    assert rv.data == b"Hello"
     assert rv.mimetype == "text/html"
 
 
@@ -1539,29 +1544,21 @@ def test_server_name_subdomain():
     assert rv.data == b"subdomain"
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
-def test_exception_propagation(app, client):
-    def apprunner(config_key):
-        @app.route("/")
-        def index():
-            1 // 0
+@pytest.mark.parametrize("key", ["TESTING", "PROPAGATE_EXCEPTIONS", "DEBUG", None])
+def test_exception_propagation(app, client, key):
+    app.testing = False
 
-        if config_key is not None:
-            app.config[config_key] = True
-            with pytest.raises(Exception):
-                client.get("/")
-        else:
-            assert client.get("/").status_code == 500
+    @app.route("/")
+    def index():
+        1 // 0
 
-    # we have to run this test in an isolated thread because if the
-    # debug flag is set to true and an exception happens the context is
-    # not torn down.  This causes other tests that run after this fail
-    # when they expect no exception on the stack.
-    for config_key in "TESTING", "PROPAGATE_EXCEPTIONS", "DEBUG", None:
-        t = Thread(target=apprunner, args=(config_key,))
-        t.start()
-        t.join()
+    if key is not None:
+        app.config[key] = True
+
+        with pytest.raises(ZeroDivisionError):
+            client.get("/")
+    else:
+        assert client.get("/").status_code == 500
 
 
 @pytest.mark.parametrize("debug", [True, False])
@@ -1684,9 +1681,11 @@ def test_no_setup_after_first_request(app, client):
 def test_before_first_request_functions(app, client):
     got = []
 
-    @app.before_first_request
-    def foo():
-        got.append(42)
+    with pytest.deprecated_call():
+
+        @app.before_first_request
+        def foo():
+            got.append(42)
 
     client.get("/")
     assert got == [42]
@@ -1698,10 +1697,12 @@ def test_before_first_request_functions(app, client):
 def test_before_first_request_functions_concurrent(app, client):
     got = []
 
-    @app.before_first_request
-    def foo():
-        time.sleep(0.2)
-        got.append(42)
+    with pytest.deprecated_call():
+
+        @app.before_first_request
+        def foo():
+            time.sleep(0.2)
+            got.append(42)
 
     def get_and_assert():
         client.get("/")
@@ -1757,57 +1758,6 @@ def test_route_decorator_custom_endpoint(app, client):
     assert client.get("/foo/").data == b"foo"
     assert client.get("/bar/").data == b"bar"
     assert client.get("/bar/123").data == b"123"
-
-
-def test_preserve_only_once(app, client):
-    app.debug = True
-
-    @app.route("/fail")
-    def fail_func():
-        1 // 0
-
-    for _x in range(3):
-        with pytest.raises(ZeroDivisionError):
-            client.get("/fail")
-
-    assert flask._request_ctx_stack.top is not None
-    assert flask._app_ctx_stack.top is not None
-    # implicit appctx disappears too
-    flask._request_ctx_stack.top.pop()
-    assert flask._request_ctx_stack.top is None
-    assert flask._app_ctx_stack.top is None
-
-
-def test_preserve_remembers_exception(app, client):
-    app.debug = True
-    errors = []
-
-    @app.route("/fail")
-    def fail_func():
-        1 // 0
-
-    @app.route("/success")
-    def success_func():
-        return "Okay"
-
-    @app.teardown_request
-    def teardown_handler(exc):
-        errors.append(exc)
-
-    # After this failure we did not yet call the teardown handler
-    with pytest.raises(ZeroDivisionError):
-        client.get("/fail")
-    assert errors == []
-
-    # But this request triggers it, and it's an error
-    client.get("/success")
-    assert len(errors) == 2
-    assert isinstance(errors[0], ZeroDivisionError)
-
-    # At this point another request does nothing.
-    client.get("/success")
-    assert len(errors) == 3
-    assert errors[1] is None
 
 
 def test_get_method_on_g(app_ctx):

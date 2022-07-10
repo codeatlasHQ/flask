@@ -310,6 +310,24 @@ def test_lazy_load_error(monkeypatch):
             lazy._flush_bg_loading_exception()
 
 
+def test_app_cli_has_app_context(app, runner):
+    def _param_cb(ctx, param, value):
+        # current_app should be available in parameter callbacks
+        return bool(current_app)
+
+    @app.cli.command()
+    @click.argument("value", callback=_param_cb)
+    def check(value):
+        app = click.get_current_context().obj.load_app()
+        # the loaded app should be the same as current_app
+        same_app = current_app._get_current_object() is app
+        return same_app, value
+
+    cli = FlaskGroup(create_app=lambda: app)
+    result = runner.invoke(cli, ["check", "x"], standalone_mode=False)
+    assert result.return_value == (True, True)
+
+
 def test_with_appcontext(runner):
     @click.command()
     @with_appcontext
@@ -323,12 +341,12 @@ def test_with_appcontext(runner):
     assert result.output == "testapp\n"
 
 
-def test_appgroup(runner):
+def test_appgroup_app_context(runner):
     @click.group(cls=AppGroup)
     def cli():
         pass
 
-    @cli.command(with_appcontext=True)
+    @cli.command()
     def test():
         click.echo(current_app.name)
 
@@ -336,7 +354,7 @@ def test_appgroup(runner):
     def subgroup():
         pass
 
-    @subgroup.command(with_appcontext=True)
+    @subgroup.command()
     def test2():
         click.echo(current_app.name)
 
@@ -351,7 +369,7 @@ def test_appgroup(runner):
     assert result.output == "testappgroup\n"
 
 
-def test_flaskgroup(runner):
+def test_flaskgroup_app_context(runner):
     def create_app():
         return Flask("flaskgroup")
 
@@ -388,6 +406,19 @@ def test_flaskgroup_debug(runner, set_debug_flag):
     assert result.output == f"{not set_debug_flag}\n"
 
 
+def test_flaskgroup_nested(app, runner):
+    cli = click.Group("cli")
+    flask_group = FlaskGroup(name="flask", create_app=lambda: app)
+    cli.add_command(flask_group)
+
+    @flask_group.command()
+    def show():
+        click.echo(current_app.name)
+
+    result = runner.invoke(cli, ["flask", "show"])
+    assert result.output == "flask_test\n"
+
+
 def test_no_command_echo_loading_error():
     from flask.cli import cli
 
@@ -422,22 +453,23 @@ def test_help_echo_exception():
 
 class TestRoutes:
     @pytest.fixture
-    def invoke(self, runner):
-        def create_app():
-            app = Flask(__name__)
-            app.testing = True
+    def app(self):
+        app = Flask(__name__)
+        app.testing = True
 
-            @app.route("/get_post/<int:x>/<int:y>", methods=["GET", "POST"])
-            def yyy_get_post(x, y):
-                pass
+        @app.route("/get_post/<int:x>/<int:y>", methods=["GET", "POST"])
+        def yyy_get_post(x, y):
+            pass
 
-            @app.route("/zzz_post", methods=["POST"])
-            def aaa_post():
-                pass
+        @app.route("/zzz_post", methods=["POST"])
+        def aaa_post():
+            pass
 
-            return app
+        return app
 
-        cli = FlaskGroup(create_app=create_app)
+    @pytest.fixture
+    def invoke(self, app, runner):
+        cli = FlaskGroup(create_app=lambda: app)
         return partial(runner.invoke, cli)
 
     @pytest.fixture
@@ -462,7 +494,7 @@ class TestRoutes:
         assert result.exit_code == 0
         self.expect_order(["aaa_post", "static", "yyy_get_post"], result.output)
 
-    def test_sort(self, invoke):
+    def test_sort(self, app, invoke):
         default_output = invoke(["routes"]).output
         endpoint_output = invoke(["routes", "-s", "endpoint"]).output
         assert default_output == endpoint_output
@@ -474,10 +506,8 @@ class TestRoutes:
             ["yyy_get_post", "static", "aaa_post"],
             invoke(["routes", "-s", "rule"]).output,
         )
-        self.expect_order(
-            ["aaa_post", "yyy_get_post", "static"],
-            invoke(["routes", "-s", "match"]).output,
-        )
+        match_order = [r.endpoint for r in app.url_map.iter_rules()]
+        self.expect_order(match_order, invoke(["routes", "-s", "match"]).output)
 
     def test_all_methods(self, invoke):
         output = invoke(["routes"]).output
